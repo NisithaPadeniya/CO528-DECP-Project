@@ -37,6 +37,10 @@ export default function MessagesPage() {
   const [showThread, setShowThread] = useState(false);
 
   const [messages, setMessages] = useState<Message[]>([]);
+  const [readBy, setReadBy] = useState<Record<string, number>>({});
+  const [typingUids, setTypingUids] = useState<Record<string, number>>({});
+  // convId -> whether the OTHER user is typing (for list preview)
+  const [convTypingMap, setConvTypingMap] = useState<Record<string, boolean>>({});
   const [inputText, setInputText] = useState('');
   const [sending, setSending] = useState(false);
 
@@ -46,9 +50,11 @@ export default function MessagesPage() {
   const [searching, setSearching] = useState(false);
   const searchTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const typingTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Subscribe to conversation list
+  const typingUnsubsRef = useRef<Record<string, () => void>>({});
   useEffect(() => {
     if (!user?.uid) return;
     const unsub = messagingService.subscribeToConversationList(user.uid, (convs) => {
@@ -60,9 +66,21 @@ export default function MessagesPage() {
             setProfileCache((prev) => ({ ...prev, [c.otherUid]: profile }));
           }).catch(() => {});
         }
+        // Subscribe to typing for this conversation if not already
+        if (!typingUnsubsRef.current[c.conversationId]) {
+          const unsubTyping = messagingService.subscribeToTyping(c.conversationId, (t) => {
+            const isOtherTyping = !!(t[c.otherUid] && t[c.otherUid] > Date.now() - 4000);
+            setConvTypingMap((prev) => ({ ...prev, [c.conversationId]: isOtherTyping }));
+          });
+          typingUnsubsRef.current[c.conversationId] = unsubTyping;
+        }
       });
     });
-    return unsub;
+    return () => {
+      unsub();
+      Object.values(typingUnsubsRef.current).forEach((u) => u());
+      typingUnsubsRef.current = {};
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.uid]);
 
@@ -75,12 +93,21 @@ export default function MessagesPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.uid, withUid]);
 
-  // Subscribe to messages when conversation changes
+  // Subscribe to messages, read receipts, and typing when conversation changes
   useEffect(() => {
     if (!selectedConvId) return;
-    const unsub = messagingService.subscribeToMessages(selectedConvId, setMessages);
-    return unsub;
-  }, [selectedConvId]);
+    const unsubMessages = messagingService.subscribeToMessages(selectedConvId, (msgs) => {
+      setMessages(msgs);
+      if (user?.uid) {
+        messagingService.markMessagesRead(selectedConvId, user.uid);
+        messagingService.markConversationRead(user.uid, selectedConvId);
+      }
+    });
+    const unsubReceipts = messagingService.subscribeToReadReceipts(selectedConvId, setReadBy);
+    const unsubTyping = messagingService.subscribeToTyping(selectedConvId, setTypingUids);
+    return () => { unsubMessages(); unsubReceipts(); unsubTyping(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedConvId, user?.uid]);
 
   // Scroll to bottom on new messages
   useEffect(() => {
@@ -107,6 +134,7 @@ export default function MessagesPage() {
     // Don't clear messages if re-selecting the same conversation
     if (convId !== selectedConvId) {
       setMessages([]);
+      setReadBy({});
     }
     setSelectedConvId(convId);
     setSelectedOtherUid(otherUid);
@@ -115,6 +143,7 @@ export default function MessagesPage() {
     setSearchResults([]);
     if (user?.uid) {
       messagingService.markConversationRead(user.uid, convId);
+      messagingService.markMessagesRead(convId, user.uid);
     }
     if (!profileCache[otherUid]) {
       userApi.getUserByUid(otherUid).then((profile) => {
@@ -130,10 +159,23 @@ export default function MessagesPage() {
     selectConversation(convId, otherUser.firebaseUid);
   }
 
+  function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
+    setInputText(e.target.value);
+    if (!selectedConvId || !user?.uid) return;
+    messagingService.setTyping(selectedConvId, user.uid, true);
+    if (typingTimeout.current) clearTimeout(typingTimeout.current);
+    typingTimeout.current = setTimeout(() => {
+      messagingService.setTyping(selectedConvId, user.uid!, false);
+    }, 3000);
+  }
+
   async function handleSend() {
     if (!inputText.trim() || !selectedConvId || !selectedOtherUid || !user?.uid) return;
     const text = inputText.trim();
     setInputText('');
+    // Clear typing indicator immediately on send
+    if (typingTimeout.current) clearTimeout(typingTimeout.current);
+    messagingService.setTyping(selectedConvId, user.uid, false);
     setSending(true);
     try {
       await messagingService.sendMessage(selectedConvId, user.uid, selectedOtherUid, text);
@@ -143,6 +185,9 @@ export default function MessagesPage() {
   }
 
   const otherProfile = selectedOtherUid ? profileCache[selectedOtherUid] : null;
+  const isOtherTyping = selectedOtherUid
+    ? (typingUids[selectedOtherUid] || 0) > Date.now() - 4000
+    : false;
   const isSearching = searchQuery.trim().length > 0;
 
   return (
@@ -151,16 +196,16 @@ export default function MessagesPage() {
         <div className="flex h-[calc(100vh-0px)] md:h-screen overflow-hidden">
 
           {/* ── Left panel: conversation list ── */}
-          <div className={`${showThread ? 'hidden md:flex' : 'flex'} flex-col w-full md:w-80 border-r border-gray-200 bg-white`}>
-            <div className="px-4 py-3 border-b border-gray-200">
-              <h1 className="text-lg font-semibold text-gray-900 mb-2">Messages</h1>
+          <div className={`${showThread ? 'hidden md:flex' : 'flex'} flex-col w-full md:w-80 border-r border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 transition-colors`}>
+            <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+              <h1 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-2">Messages</h1>
               {/* Search input */}
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search people…"
-                className="w-full text-sm border border-gray-200 rounded-lg px-3 py-1.5 focus:outline-none focus:border-blue-400"
+                className="w-full text-sm border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 rounded-lg px-3 py-1.5 focus:outline-none focus:border-blue-400 transition-colors"
               />
             </div>
 
@@ -176,7 +221,7 @@ export default function MessagesPage() {
                     <button
                       key={u.firebaseUid}
                       onClick={() => handleStartConversation(u)}
-                      className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors border-b border-gray-100"
+                      className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors border-b border-gray-100 dark:border-gray-800"
                     >
                       <UserAvatar
                         name={u.name}
@@ -186,8 +231,8 @@ export default function MessagesPage() {
                         size="md"
                       />
                       <div className="min-w-0">
-                        <p className="text-sm font-medium text-gray-900 truncate">{u.name}</p>
-                        <p className="text-xs text-gray-400 truncate">{u.department || u.role}</p>
+                        <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{u.name}</p>
+                        <p className="text-xs text-gray-400 dark:text-gray-500 truncate">{u.department || u.role}</p>
                       </div>
                     </button>
                   ))}
@@ -204,11 +249,12 @@ export default function MessagesPage() {
                   {conversations.map((conv) => {
                     const profile = profileCache[conv.otherUid];
                     const isSelected = conv.conversationId === selectedConvId;
+                    const isTypingInList = convTypingMap[conv.conversationId];
                     return (
                       <button
                         key={conv.conversationId}
                         onClick={() => selectConversation(conv.conversationId, conv.otherUid)}
-                        className={`w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors border-b border-gray-100 ${isSelected ? 'bg-blue-50' : ''}`}
+                        className={`w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors border-b border-gray-100 dark:border-gray-800 ${isSelected ? 'bg-blue-50 dark:bg-blue-500/15' : ''}`}
                       >
                         <div className="shrink-0">
                           <UserAvatar
@@ -220,20 +266,39 @@ export default function MessagesPage() {
                           />
                         </div>
                         <div className="flex-1 min-w-0">
+                          
+                          
+                          
                           <div className="flex items-center justify-between">
-                            <span className="text-sm font-medium text-gray-900 truncate">
+                            <span className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">
                               {profile?.name || '…'}
                             </span>
-                            <span className="text-xs text-gray-400 shrink-0 ml-2">{timeAgo(conv.lastMessageAt)}</span>
+                            <span className="text-xs text-gray-400 dark:text-gray-500 shrink-0 ml-2">{timeAgo(conv.lastMessageAt)}</span>
                           </div>
+                          
+                          
                           <div className="flex items-center justify-between mt-0.5">
-                            <span className="text-xs text-gray-500 truncate">{conv.lastMessage || 'Say hello!'}</span>
-                            {conv.unreadCount > 0 && (
-                              <span className="ml-2 shrink-0 bg-blue-600 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
-                                {conv.unreadCount > 9 ? '9+' : conv.unreadCount}
-                              </span>
-                            )}
-                          </div>
+  {isTypingInList ? (
+    <span className="flex items-center gap-1 text-xs italic text-blue-500">
+      typing
+      <span className="flex gap-0.5">
+        <span className="h-1 w-1 rounded-full bg-blue-400 animate-bounce [animation-delay:0ms]" />
+        <span className="h-1 w-1 rounded-full bg-blue-400 animate-bounce [animation-delay:150ms]" />
+        <span className="h-1 w-1 rounded-full bg-blue-400 animate-bounce [animation-delay:300ms]" />
+      </span>
+    </span>
+  ) : (
+    <span className="truncate text-xs text-gray-500 dark:text-gray-400">
+      {conv.lastMessage || 'Say hello!'}
+    </span>
+  )}
+  {conv.unreadCount > 0 && (
+    <span className="ml-2 shrink-0 bg-blue-600 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+      {conv.unreadCount > 9 ? '9+' : conv.unreadCount}
+    </span>
+  )}
+</div>
+                        
                         </div>
                       </button>
                     );
@@ -244,22 +309,22 @@ export default function MessagesPage() {
           </div>
 
           {/* ── Right panel: message thread ── */}
-          <div className={`${showThread ? 'flex' : 'hidden md:flex'} flex-1 flex-col bg-white`}>
+          <div className={`${showThread ? 'flex' : 'hidden md:flex'} flex-1 flex-col bg-white dark:bg-gray-950 transition-colors`}>
             {!selectedConvId ? (
               <div className="flex-1 flex items-center justify-center text-center px-4">
                 <div>
                   <div className="text-4xl mb-3">💬</div>
-                  <p className="text-gray-500 text-sm">Select a conversation or</p>
-                  <p className="text-gray-500 text-sm">search for someone to start messaging.</p>
+                  <p className="text-gray-500 dark:text-gray-400 text-sm">Select a conversation or</p>
+                  <p className="text-gray-500 dark:text-gray-400 text-sm">search for someone to start messaging.</p>
                 </div>
               </div>
             ) : (
               <>
                 {/* Thread header */}
-                <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-200">
+                <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-200 dark:border-gray-800">
                   <button
                     onClick={() => setShowThread(false)}
-                    className="md:hidden text-gray-500 hover:text-gray-700 mr-1"
+                    className="md:hidden text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 mr-1"
                     aria-label="Back"
                   >
                     ←
@@ -273,7 +338,7 @@ export default function MessagesPage() {
                         roleBadge={otherProfile.roleBadge}
                         size="sm"
                       />
-                      <span className="font-semibold text-gray-900 text-sm">{otherProfile.name}</span>
+                      <span className="font-semibold text-gray-900 dark:text-gray-100 text-sm">{otherProfile.name}</span>
                     </Link>
                   ) : (
                     <span className="text-sm text-gray-400">Loading…</span>
@@ -287,32 +352,48 @@ export default function MessagesPage() {
                   )}
                   {messages.map((msg) => {
                     const isMine = msg.senderId === user?.uid;
+                    const otherReadAt = selectedOtherUid ? (readBy[selectedOtherUid] || 0) : 0;
+                    const isRead = isMine && otherReadAt >= msg.sentAt;
                     return (
                       <div key={msg.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
                         <div className="max-w-[70%]">
                           <div className={`px-4 py-2 rounded-2xl text-sm ${
                             isMine
                               ? 'bg-blue-600 text-white rounded-br-sm'
-                              : 'bg-gray-100 text-gray-900 rounded-bl-sm'
+                              : 'bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-bl-sm'
                           }`}>
                             {msg.text}
                           </div>
-                          <p className={`text-xs text-gray-400 mt-0.5 ${isMine ? 'text-right' : 'text-left'}`}>
+                          <p className={`text-xs mt-0.5 ${isMine ? 'text-right' : 'text-left'} ${isRead ? 'text-blue-500' : 'text-gray-400'}`}>
                             {timeAgo(msg.sentAt)}
+                            {isMine && (
+                              <span className="ml-1">
+                                {isRead ? '✓✓ Read' : '✓ Delivered'}
+                              </span>
+                            )}
                           </p>
                         </div>
                       </div>
                     );
                   })}
+                  {isOtherTyping && (
+                    <div className="flex justify-start">
+                      <div className="bg-gray-100 rounded-2xl rounded-bl-sm px-4 py-2.5 flex items-center gap-1">
+                        <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:0ms]" />
+                        <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:150ms]" />
+                        <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:300ms]" />
+                      </div>
+                    </div>
+                  )}
                   <div ref={messagesEndRef} />
                 </div>
 
                 {/* Input */}
-                <div className="px-4 py-3 border-t border-gray-200 flex gap-2">
+                <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-800 flex gap-2">
                   <input
                     type="text"
                     value={inputText}
-                    onChange={(e) => setInputText(e.target.value)}
+                    onChange={handleInputChange}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && !e.shiftKey) {
                         e.preventDefault();
@@ -320,7 +401,7 @@ export default function MessagesPage() {
                       }
                     }}
                     placeholder="Type a message…"
-                    className="flex-1 text-sm border border-gray-200 rounded-xl px-4 py-2 focus:outline-none focus:border-blue-400"
+                    className="flex-1 text-sm border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 rounded-xl px-4 py-2 focus:outline-none focus:border-blue-400 transition-colors"
                     disabled={sending}
                   />
                   <button
